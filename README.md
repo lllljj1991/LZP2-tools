@@ -7,6 +7,7 @@ A Python script for unpack and repack LZP2 files of Dynasty Warriors 4 &amp; 5. 
 使用方式/Usage：
 
 单文件解包/single file unpack:
+
 python lzp2.py -d <INPUT> <OUTPUT>  e.g. lzp2.py -d input.txt output.lzp2
 
 单文件打包/single file repack:
