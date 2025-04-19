@@ -31,3 +31,7 @@ python lzp2.py -bd <INPUTS> <OUTPUT_DIR>
 e.g. lzp2.py -bc file1.lzp2 file2.lzp2 output_dir/ 
 
 or lzp2.py -bc input_dir/ output_dir/
+
+The unpack code is optimized from DW5Tools created by synch12. https://github.com/synch12/DW5Tools
+
+解包代码优化自synch12编写的工具DW5Tools。
