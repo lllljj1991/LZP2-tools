@@ -147,9 +147,12 @@ def compress_lzp2(input_data: bytes) -> bytes:
             pos += literal_len
 
     # 更新压缩后大小并填充
-    total_size = len(compressed) + (16 - (len(compressed) % 16)) % 16
-    compressed[12:16] = struct.pack('<I', total_size)
-    compressed.extend(b'\x00' * (total_size - len(compressed)))
+    data_size = len(compressed) - 16  # 排除文件头
+    padding = (16 - (data_size % 16)) % 16
+    total_data_size = data_size + padding
+    compressed[12:16] = struct.pack('<I', total_data_size)
+    compressed.extend(b'\x00' * padding)
+    
     return bytes(compressed)
 
 def update_hash_table_batch(buffer: bytearray, hash_table: dict, start_pos: int, end_pos: int):
