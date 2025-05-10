@@ -8,13 +8,13 @@ A Python script for unpack and repack LZP2 files of Dynasty Warriors 4 &amp; 5. 
 
 单文件解包/single file unpack:
 
-python lzp2.py -d <INPUT> <OUTPUT>  e.g. lzp2.py -d input.txt output.lzp2
+python lzp2.py -d <INPUT> <OUTPUT>  e.g. lzp2.py -d output.lzp2 input.txt
 
 单文件打包/single file repack:
 
 python lzp2.py -c <INPUT> <OUTPUT> 
 
-e.g. lzp2.py -c input.lzp2 output.txt
+e.g. lzp2.py -c output.txt input.lzp2
 
 多文件解包/multiple files unpack:
 
@@ -26,7 +26,7 @@ or lzp2.py -bd input_dir/ output_dir/
 
 多文件打包/multiple files repack:
 
-python lzp2.py -bd <INPUTS> <OUTPUT_DIR> 
+python lzp2.py -bc <INPUTS> <OUTPUT_DIR> 
 
 e.g. lzp2.py -bc file1.lzp2 file2.lzp2 output_dir/ 
 
