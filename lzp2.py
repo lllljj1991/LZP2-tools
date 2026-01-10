@@ -84,7 +84,7 @@ def decompress_lzp2_file(in_path, out_path):
     with open(in_path, 'rb') as in_file:
         decompress_lzp2(in_file, out_path)
 
-# -------------------------- 压缩模块 --------------------------
+# -------------------------- 压缩模块（最接近原始版本但修复问题） --------------------------
 def compress_lzp2(input_data: bytes) -> bytes:
     compressed = bytearray()
     compressed.extend(bytes.fromhex('4C5A5032AE47813F'))
@@ -101,8 +101,9 @@ def compress_lzp2(input_data: bytes) -> bytes:
         rle_len = get_rle_length(input_data, pos)
         best_len, best_offset = find_best_match(output_buffer, input_data, pos, hash_table)
         
-        # 选择RLE或引用中更优的
+        # 选择RLE或引用中更优的 - 使用原始代码的逻辑
         if rle_len >= 4 and rle_len >= best_len:
+            # RLE压缩
             cmd = 0x40 | ((rle_len - 4) >> 8 & 0x3F)
             low_byte = (rle_len - 4) & 0xFF
             compressed.append(cmd)
@@ -114,6 +115,7 @@ def compress_lzp2(input_data: bytes) -> bytes:
             update_hash_table_batch(output_buffer, hash_table, original_len, len(output_buffer))
             pos += rle_len
         elif best_len >= 3:
+            # 引用压缩 - 修复原始代码中的问题
             offset_code = best_offset - 1
             offset_high = (offset_code >> 8) & 0x07
             offset_low = offset_code & 0xFF
@@ -121,24 +123,31 @@ def compress_lzp2(input_data: bytes) -> bytes:
             cmd = 0x80 | (incr << 3) | offset_high
             compressed.append(cmd)
             compressed.append(offset_low)
-            # 批量更新哈希表
+            # 批量更新哈希表 - 修复引用逻辑
             original_len = len(output_buffer)
-            for _ in range(best_len):
-                ref_pos = original_len - best_offset + _
+            for i in range(best_len):
+                ref_pos = original_len - best_offset + i
                 if ref_pos < 0 or ref_pos >= original_len:
-                    ref_pos = 0
-                output_buffer.append(output_buffer[ref_pos])
+                    # 如果引用位置无效，使用当前位置的数据
+                    output_buffer.append(input_data[pos + i])
+                else:
+                    output_buffer.append(output_buffer[ref_pos])
             update_hash_table_batch(output_buffer, hash_table, original_len, len(output_buffer))
             pos += best_len
         else:
-            # 处理字面量，优化为贪心策略
+            # 处理字面量 - 使用原始代码的贪心策略
             max_literal_len = min(63, len(input_data) - pos)
             literal_len = 1
-            while literal_len < max_literal_len and (pos + literal_len < len(input_data)):
+            while literal_len < max_literal_len:
                 next_pos = pos + literal_len
-                if get_rle_length(input_data, next_pos) >=4 or find_best_match(output_buffer, input_data, next_pos, hash_table)[0] >=3:
-                    break
-                literal_len +=1
+                # 检查下一个位置是否有更好的压缩机会
+                if (get_rle_length(input_data, next_pos) >= 4 or 
+                    find_best_match(output_buffer, input_data, next_pos, hash_table)[0] >= 3):
+                    # 如果下一个位置有压缩机会，且当前字面量已经有一定长度，则停止
+                    if literal_len >= 1:
+                        break
+                literal_len += 1
+            
             compressed.append(literal_len)
             compressed.extend(input_data[pos:pos+literal_len])
             original_len = len(output_buffer)
@@ -157,66 +166,95 @@ def compress_lzp2(input_data: bytes) -> bytes:
 
 def update_hash_table_batch(buffer: bytearray, hash_table: dict, start_pos: int, end_pos: int):
     """批量更新哈希表，处理从start_pos到end_pos新增的三元组"""
-    for i in range(max(start_pos -2, 0), end_pos -2):
-        if i +2 >= len(buffer):
+    for i in range(max(start_pos - 2, 0), end_pos - 2):
+        if i + 2 >= len(buffer):
             continue
         current_triple = buffer[i:i+3]
         key = (current_triple[0] << 16) | (current_triple[1] << 8) | current_triple[2]
         if key not in hash_table:
             hash_table[key] = []
         candidates = hash_table[key]
-        # 维护候选列表，保留最近50个且偏移不超过2048
+        
+        # 添加新位置
         candidates.append(i)
-        # 过滤无效候选
+        
+        # 清理旧的候选位置
+        # 只保留最近的位置，且偏移不超过2048
         valid_candidates = []
         for c in candidates:
-            if (len(buffer) - c) <= 2048:
+            if len(buffer) - c <= 2048:  # 偏移在窗口内
                 valid_candidates.append(c)
-        # 保留最多50个
-        if len(valid_candidates) > 50:
-            valid_candidates = valid_candidates[-50:]
+        
+        # 保留最多100个最近的位置
+        if len(valid_candidates) > 100:
+            valid_candidates = valid_candidates[-100:]
+        
         hash_table[key] = valid_candidates
 
 def get_rle_length(data: bytes, pos: int) -> int:
+    """获取RLE长度"""
     if pos >= len(data):
         return 0
-    current = data[pos]
-    max_end = min(pos + 16387, len(data))
-    end = pos +1
-    while end < max_end and data[end] == current:
-        end +=1
-    length = end - pos
-    return length if length >=4 else 0
+    
+    value = data[pos]
+    max_len = min(pos + 16387, len(data))
+    length = 1
+    
+    while pos + length < max_len and data[pos + length] == value:
+        length += 1
+    
+    return length if length >= 4 else 0
 
 def find_best_match(output_buffer: bytearray, input_data: bytes, pos: int, hash_table: dict) -> Tuple[int, int]:
+    """查找最佳匹配"""
     max_offset = 2048
     max_len = 18
-    if pos +2 >= len(input_data):
-        return (0, 0)
+    
+    if pos + 2 >= len(input_data):
+        return 0, 0
+    
+    # 计算哈希键
     current_triple = input_data[pos:pos+3]
     key = (current_triple[0] << 16) | (current_triple[1] << 8) | current_triple[2]
-    candidates = hash_table.get(key, [])[-50:]  # 只检查最近50个候选
-
+    
+    candidates = hash_table.get(key, [])
+    
     best_len, best_offset = 0, 0
-    for candidate in reversed(candidates):  # 逆序检查最近的候选
-        if candidate +2 >= len(output_buffer):
+    
+    # 检查最近的候选位置
+    for candidate in reversed(candidates[-100:]):  # 只检查最近的100个
+        if candidate >= len(output_buffer):
             continue
+        
         offset = len(output_buffer) - candidate
         if offset > max_offset:
             continue
+        
+        # 计算最大可能匹配长度
         max_possible_len = min(max_len, len(input_data) - pos, len(output_buffer) - candidate)
-        # 使用切片比较提高速度
-        match_len = 0
-        buffer_slice = output_buffer[candidate:candidate+max_possible_len]
-        input_slice = input_data[pos:pos+max_possible_len]
-        while match_len < len(buffer_slice) and buffer_slice[match_len] == input_slice[match_len]:
-            match_len +=1
-        if match_len > best_len or (match_len == best_len and offset < best_offset):
+        
+        # 快速检查前3个字节
+        if candidate + 2 >= len(output_buffer):
+            continue
+        if output_buffer[candidate:candidate+3] != current_triple:
+            continue
+        
+        # 计算实际匹配长度
+        match_len = 3
+        while (match_len < max_possible_len and 
+               pos + match_len < len(input_data) and
+               candidate + match_len < len(output_buffer) and
+               input_data[pos + match_len] == output_buffer[candidate + match_len]):
+            match_len += 1
+        
+        # 更新最佳匹配
+        if match_len > best_len:
             best_len = match_len
             best_offset = offset
             if best_len == max_len:
-                break  # 提前终止
-    return (best_len, best_offset) if best_offset <= max_offset and best_len >=3 else (0, 0)
+                break
+    
+    return (best_len, best_offset) if best_len >= 3 else (0, 0)
 
 def compress_lzp2_file(input_path: str, output_path: str):
     with open(input_path, 'rb') as f:
