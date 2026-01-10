@@ -101,8 +101,9 @@ def compress_lzp2(input_data: bytes) -> bytes:
         rle_len = get_rle_length(input_data, pos)
         best_len, best_offset = find_best_match(output_buffer, input_data, pos, hash_table)
         
-        # 选择RLE或引用中更优的
+        # 选择RLE或引用中更优的 - 使用原始代码的逻辑
         if rle_len >= 4 and rle_len >= best_len:
+            # RLE压缩
             cmd = 0x40 | ((rle_len - 4) >> 8 & 0x3F)
             low_byte = (rle_len - 4) & 0xFF
             compressed.append(cmd)
@@ -114,6 +115,7 @@ def compress_lzp2(input_data: bytes) -> bytes:
             update_hash_table_batch(output_buffer, hash_table, original_len, len(output_buffer))
             pos += rle_len
         elif best_len >= 3:
+            # 引用压缩 - 修复原始代码中的问题
             offset_code = best_offset - 1
             offset_high = (offset_code >> 8) & 0x07
             offset_low = offset_code & 0xFF
@@ -121,24 +123,31 @@ def compress_lzp2(input_data: bytes) -> bytes:
             cmd = 0x80 | (incr << 3) | offset_high
             compressed.append(cmd)
             compressed.append(offset_low)
-            # 批量更新哈希表
+            # 批量更新哈希表 - 修复引用逻辑
             original_len = len(output_buffer)
-            for _ in range(best_len):
-                ref_pos = original_len - best_offset + _
+            for i in range(best_len):
+                ref_pos = original_len - best_offset + i
                 if ref_pos < 0 or ref_pos >= original_len:
-                    ref_pos = 0
-                output_buffer.append(output_buffer[ref_pos])
+                    # 如果引用位置无效，使用当前位置的数据
+                    output_buffer.append(input_data[pos + i])
+                else:
+                    output_buffer.append(output_buffer[ref_pos])
             update_hash_table_batch(output_buffer, hash_table, original_len, len(output_buffer))
             pos += best_len
         else:
-            # 处理字面量，优化为贪心策略
+            # 处理字面量 - 使用原始代码的贪心策略
             max_literal_len = min(63, len(input_data) - pos)
             literal_len = 1
-            while literal_len < max_literal_len and (pos + literal_len < len(input_data)):
+            while literal_len < max_literal_len:
                 next_pos = pos + literal_len
-                if get_rle_length(input_data, next_pos) >=4 or find_best_match(output_buffer, input_data, next_pos, hash_table)[0] >=3:
-                    break
-                literal_len +=1
+                # 检查下一个位置是否有更好的压缩机会
+                if (get_rle_length(input_data, next_pos) >= 4 or 
+                    find_best_match(output_buffer, input_data, next_pos, hash_table)[0] >= 3):
+                    # 如果下一个位置有压缩机会，且当前字面量已经有一定长度，则停止
+                    if literal_len >= 1:
+                        break
+                literal_len += 1
+            
             compressed.append(literal_len)
             compressed.extend(input_data[pos:pos+literal_len])
             original_len = len(output_buffer)
@@ -317,3 +326,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
