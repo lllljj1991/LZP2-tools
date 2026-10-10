@@ -1,264 +1,337 @@
 import struct
-import math
-from typing import BinaryIO, Tuple, List, Dict
+import time
 import sys
+import os
+import unicodedata
+from typing import BinaryIO, Tuple, Optional
 
+
+# ---------------------------------------------------------------------------
+# 显示宽度与终端能力
+# ---------------------------------------------------------------------------
+def _display_width(s: str) -> int:
+    """估算字符串在终端里的显示宽度（东亚宽字符算 2 列，组合字符 0 列）。"""
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ('F', 'W') else 1
+    return w
+
+
+def _supports_ansi() -> bool:
+    if os.environ.get('NO_COLOR') or os.environ.get('TERM') == 'dumb':
+        return False
+    if os.name == 'nt':
+        return bool(os.environ.get('WT_SESSION') or
+                    os.environ.get('ANSICON') or
+                    os.environ.get('ConEmuANSI') == 'ON')
+    return True
+
+
+def _terminal_width(default: int = 100) -> int:
+    try:
+        return os.get_terminal_size(sys.stderr.fileno()).columns
+    except (OSError, ValueError, AttributeError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# 进度报告器
+# ---------------------------------------------------------------------------
+class ProgressReporter:
+    """原地（\\r）刷新进度，每秒最多刷 1 次；每个文件最终只留 1 行。
+
+    关键：进度条宽度按终端宽度和"行固定部分"的实际显示宽度自适应，
+    确保每帧不会触发终端折行——折行会破坏 \\r 的原地覆盖。
+    """
+
+    def __init__(self, total: int, label: str = "压缩进度",
+                 max_bar_width: int = 30, min_interval: float = 1.0):
+        self.total = max(total, 1)
+        self.label = label
+        self.min_interval = min_interval
+        self.start_time = time.monotonic()
+        self.last_update_time = None
+        self.current = 0
+        self.use_ansi = _supports_ansi()
+
+        # —— 用最坏情况值测出"固定部分"（不含进度条）的显示宽度 ——
+        worst_fixed = (
+            f"{label}: [] "
+            f"{100.0:6.2f}%  "
+            f"({4294967295:>11,}/{4294967295:>11,} B)  "
+            f"{'999.99 MB/s':>10}  "
+            f"耗时 {'9999.99s':>8}  "
+            f"预计剩余 {'99h59m':>6}"
+        )
+        fixed_w = _display_width(worst_fixed)
+        term_w = _terminal_width()
+        avail = term_w - fixed_w - 1          # 预留 1 列防止折行
+        self.bar_width = max(5, min(max_bar_width, avail))
+
+    # ---- 对外接口 ----
+    def update(self, current: int, force: bool = False):
+        self.current = current
+        now = time.monotonic()
+        if (not force
+                and self.last_update_time is not None
+                and (now - self.last_update_time) < self.min_interval):
+            return
+        self.last_update_time = now
+        self._write_line(self._format_line(current, now))
+
+    def finish(self, extra: Optional[str] = None):
+        now = time.monotonic()
+        self.current = self.total
+        self._write_line(self._format_line(self.total, now, extra), newline=True)
+
+    # ---- 内部 ----
+    def _write_line(self, line: str, newline: bool = False):
+        if self.use_ansi:
+            payload = '\r\033[K' + line
+        else:
+            payload = '\r' + line
+        if newline:
+            payload += '\n'
+        sys.stderr.write(payload)
+        sys.stderr.flush()
+
+    def _format_line(self, current: int, now: float,
+                     extra: Optional[str] = None) -> str:
+        percent = current * 100.0 / self.total
+        filled = min(int(self.bar_width * percent / 100.0), self.bar_width)
+        bar = '█' * filled + '░' * (self.bar_width - filled)
+
+        elapsed = now - self.start_time
+        speed = current / elapsed if elapsed > 0 else 0.0
+
+        remaining = self.total - current
+        if remaining <= 0:
+            eta_str = '0.0s'
+        elif speed > 0:
+            eta_str = self._format_time(remaining / speed)
+        else:
+            eta_str = '--'
+
+        line = (f"{self.label}: [{bar}] "
+                f"{percent:6.2f}%  "
+                f"({current:>11,}/{self.total:>11,} B)  "
+                f"{self._fmt_speed(speed):>10}  "
+                f"耗时 {self._fmt_elapsed(elapsed):>8}  "
+                f"预计剩余 {eta_str:>6}")
+        if extra:
+            line += f"  {extra}"
+        return line
+
+    @staticmethod
+    def _fmt_speed(bps: float) -> str:
+        if bps >= 1024 * 1024:
+            return f"{bps / 1024 / 1024:6.2f} MB/s"
+        if bps >= 1024:
+            return f"{bps / 1024:6.2f} KB/s"
+        return f"{bps:6.1f} B/s"
+
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.2f}s"
+        if seconds < 3600:
+            m, s = divmod(int(seconds), 60)
+            return f"{m}m{s:02d}s"
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h{m:02d}m"
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        if seconds < 0 or seconds != seconds:
+            return '--'
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        if seconds < 3600:
+            m, s = divmod(int(seconds), 60)
+            return f"{m}m{s:02d}s"
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h{m:02d}m"
+
+
+# ---------------------------------------------------------------------------
+# LZP2 压缩器
+# ---------------------------------------------------------------------------
 class LZP2Compressor:
     def __init__(self):
-        self.window_size = 0x800  # 滑动窗口大小
-        self.max_match_length = 18  # 最大匹配长度
-        self.min_match_length = 3   # 最小匹配长度
-        
-    def compress(self, data: bytes) -> bytes:
-        """
-        压缩数据为LZP2格式
-        """
+        self.window_size = 0x800
+        self.max_match_length = 18
+        self.min_match_length = 3
+
+    def compress(self, data: bytes,
+                 progress: Optional[ProgressReporter] = None) -> bytes:
         compressed = bytearray()
         i = 0
         data_len = len(data)
-        
+
         while i < data_len:
-            # 1. 查找最长匹配
             match_offset, match_length = self._find_longest_match(data, i)
-            
-            # 2. 检查RLE模式（连续相同字符）
             rle_length = self._get_rle_length(data, i)
-            
-            # 3. 选择最佳压缩模式
+
             if rle_length >= 4 and rle_length >= match_length:
-                # 使用RLE压缩
                 compressed.extend(self._encode_rle(rle_length, data[i]))
                 i += rle_length
             elif match_length >= self.min_match_length:
-                # 使用LZ77引用压缩
                 compressed.extend(self._encode_reference(match_offset, match_length))
                 i += match_length
             else:
-                # 直接存储字节
                 gap_end = self._find_gap_end(data, i)
-                gap_length = gap_end - i
-                
-                # 确保gap长度不超过63（因为gap字段只有6位）
-                gap_length = min(gap_length, 63)
-                
+                gap_length = min(gap_end - i, 63)
                 if gap_length > 0:
-                    compressed.append(gap_length)  # gap长度
+                    compressed.append(gap_length)
                     compressed.extend(data[i:i + gap_length])
                     i += gap_length
                 else:
-                    # 至少移动一个字节
                     compressed.append(1)
                     compressed.append(data[i])
                     i += 1
-        
-        # 填充到16的倍数
+
+            if progress is not None:
+                progress.update(i)
+
         padding_len = (16 - (len(compressed) % 16)) % 16
         if padding_len > 0:
             compressed.extend(bytes(padding_len))
-        
+
         return bytes(compressed)
-    
+
+    # === 以下与原代码完全一致 ===
     def _find_longest_match(self, data: bytes, current_pos: int) -> Tuple[int, int]:
-        """
-        在滑动窗口中查找最长匹配
-        """
         max_length = 0
         best_offset = 0
-        
-        # 滑动窗口起始位置
         window_start = max(0, current_pos - self.window_size)
-        
-        # 最小匹配长度
         min_len = self.min_match_length
-        
-        # 遍历滑动窗口中的位置
         for check_pos in range(window_start, current_pos):
             length = 0
-            
-            # 计算最大可能匹配长度
-            max_possible = min(
-                self.max_match_length,
-                len(data) - current_pos,
-                current_pos - check_pos
-            )
-            
-            # 比较字符
-            while (length < max_possible and 
+            max_possible = min(self.max_match_length,
+                               len(data) - current_pos,
+                               current_pos - check_pos)
+            while (length < max_possible and
                    data[check_pos + length] == data[current_pos + length]):
                 length += 1
-            
-            # 更新最佳匹配
             if length >= min_len and length > max_length:
                 max_length = length
                 best_offset = current_pos - check_pos
-        
         return best_offset, max_length
-    
+
     def _get_rle_length(self, data: bytes, current_pos: int) -> int:
-        """
-        获取连续相同字符的长度
-        """
         if current_pos >= len(data):
             return 0
-            
         value = data[current_pos]
         length = 1
-        
-        while (current_pos + length < len(data) and 
-               data[current_pos + length] == value and 
-               length < 0x4003):  # RLE最大长度限制
+        while (current_pos + length < len(data) and
+               data[current_pos + length] == value and
+               length < 0x4003):
             length += 1
-            
         return length
-    
+
     def _find_gap_end(self, data: bytes, current_pos: int) -> int:
-        """
-        找到可以直接存储的连续字节的结束位置
-        """
         end_pos = current_pos
         while end_pos < len(data):
-            # 检查是否可以从这里开始匹配或RLE
-            match_offset, match_length = self._find_longest_match(data, end_pos)
+            _, match_length = self._find_longest_match(data, end_pos)
             rle_length = self._get_rle_length(data, end_pos)
-            
-            # 如果找到足够长的匹配或RLE，停止
             if match_length >= self.min_match_length or rle_length >= 4:
                 break
-            
-            # 如果gap长度达到最大，停止
             if end_pos - current_pos >= 63:
                 break
-                
             end_pos += 1
-            
         return end_pos
-    
+
     def _encode_reference(self, offset: int, length: int) -> bytes:
-        """
-        编码LZ77引用
-        格式: [0b1xxxxxxx] [offset_low]
-        """
         if offset == 0:
-            return bytes([length])  # 实际上不应该发生
-        
-        # 计算编码长度 (3-18)
+            return bytes([length])
         encoded_length = min(length, self.max_match_length)
-        
-        # 构建第一个字节
-        # 位布局: 1(固定) + 4位长度编码 + 3位offset高字节
-        first_byte = 0x80  # 设置最高位
-        
-        # 添加长度编码 (3-18 映射到 0-15)
+        first_byte = 0x80
         length_code = encoded_length - 3
-        
-        # 设置位3-6
-        if length_code & 0x01: first_byte |= 0x08  # 位3
-        if length_code & 0x02: first_byte |= 0x10  # 位4
-        if length_code & 0x04: first_byte |= 0x20  # 位5
-        if length_code & 0x08: first_byte |= 0x40  # 位6
-        
-        # 添加offset高3位到低3位
+        if length_code & 0x01: first_byte |= 0x08
+        if length_code & 0x02: first_byte |= 0x10
+        if length_code & 0x04: first_byte |= 0x20
+        if length_code & 0x08: first_byte |= 0x40
         offset_high = (offset - 1) >> 8
         first_byte |= offset_high & 0x07
-        
-        # 第二个字节是offset的低8位
         offset_low = (offset - 1) & 0xFF
-        
         return bytes([first_byte, offset_low])
-    
+
     def _encode_rle(self, length: int, value: int) -> bytes:
-        """
-        编码RLE
-        格式: [0b01xxxxxx] [length_low] [value]
-        """
-        # 计算存储的长度值 (实际长度 - 4)
         store_length = min(length, 0x4003) - 4
-        
-        # 第一个字节: 0x40 + 长度的高6位
         first_byte = 0x40 | ((store_length >> 8) & 0x3F)
-        
-        # 第二个字节: 长度的低8位
         second_byte = store_length & 0xFF
-        
         return bytes([first_byte, second_byte, value])
 
+
+# ---------------------------------------------------------------------------
+# 文件头 / 入口
+# ---------------------------------------------------------------------------
 def create_lzp2_header(original_size: int, compressed_size: int) -> bytes:
-    """
-    创建LZP2文件头
-    """
     header = bytearray()
-    
-    # 固定头: "LZP2" + 魔数
     header.extend([0x4C, 0x5A, 0x50, 0x32, 0xAE, 0x47, 0x81, 0x3F])
-    
-    # 原始文件大小 (小端序)
     header.extend(struct.pack('<I', original_size))
-    
-    # 压缩数据大小 (小端序)
     header.extend(struct.pack('<I', compressed_size))
-    
     return bytes(header)
 
-def compress_lzp2(in_stream: BinaryIO, out_stream: BinaryIO):
-    """
-    压缩文件为LZP2格式
-    """
-    # 读取输入文件
+
+def _stderr_is_tty() -> bool:
+    try:
+        return sys.stderr.isatty()
+    except Exception:
+        return False
+
+
+def compress_lzp2(in_stream: BinaryIO, out_stream: BinaryIO,
+                  show_progress: Optional[bool] = None):
+    if show_progress is None:
+        show_progress = _stderr_is_tty()
+
     data = in_stream.read()
     original_size = len(data)
-    
-    # 压缩数据
+
+    progress = ProgressReporter(original_size) if show_progress else None
+
     compressor = LZP2Compressor()
-    compressed_data = compressor.compress(data)
-    
-    # 计算压缩后大小 (不包括文件头)
+    compressed_data = compressor.compress(data, progress=progress)
+
     compressed_size = len(compressed_data)
-    
-    # 确保压缩数据大小是16的倍数
     if compressed_size % 16 != 0:
         padding = 16 - (compressed_size % 16)
         compressed_data += b'\x00' * padding
         compressed_size = len(compressed_data)
-    
-    # 写入文件头
+
+    if progress is not None:
+        ratio = (compressed_size / original_size * 100) if original_size else 0.0
+        progress.finish(f"压缩率 {ratio:.2f}%")
+
     header = create_lzp2_header(original_size, compressed_size)
     out_stream.write(header)
-    
-    # 写入压缩数据
     out_stream.write(compressed_data)
 
-def compress_lzp2_file(in_path: str, out_path: str):
-    """
-    压缩文件为LZP2格式 (文件接口)
-    """
+
+def compress_lzp2_file(in_path: str, out_path: str,
+                       show_progress: Optional[bool] = None):
     with open(in_path, 'rb') as in_file:
         with open(out_path, 'wb') as out_file:
-            compress_lzp2(in_file, out_file)
-    
-    # 输出压缩信息
-    original_size = os.path.getsize(in_path)
-    compressed_size = os.path.getsize(out_path) - 16  # 减去文件头
-    ratio = (compressed_size / original_size) * 100 if original_size > 0 else 0
-    
-    print(f"压缩完成: {in_path} -> {out_path}")
-    print(f"原始大小: {original_size} 字节")
-    print(f"压缩大小: {compressed_size} 字节 (不包括16字节文件头)")
-    print(f"压缩率: {ratio:.2f}%")
+            compress_lzp2(in_file, out_file, show_progress=show_progress)
+
 
 def main():
-    """
-    主函数：命令行接口
-    """
-    if len(sys.argv) != 3:
-        print("使用方法: python lzp2_compress.py <输入文件> <输出文件>")
+    if len(sys.argv) < 3:
+        print("使用方法: python lzp2_compress.py <输入文件> <输出文件> [--quiet]")
         print("示例: python lzp2_compress.py input.txt output.lzp2")
         sys.exit(1)
-    
+
     in_path = sys.argv[1]
     out_path = sys.argv[2]
-    
-    compress_lzp2_file(in_path, out_path)
+    quiet = '--quiet' in sys.argv[3:] or '-q' in sys.argv[3:]
+
+    compress_lzp2_file(in_path, out_path, show_progress=not quiet)
+
 
 if __name__ == "__main__":
-    import os
     main()
